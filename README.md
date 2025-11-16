@@ -1,2 +1,200 @@
-# php-openai-chatgpt-api
-Tools around ChatGPT (OpenAI)
+# OpenAI ChatGPT API Client for PHP
+
+Lightweight PHP client for OpenAI’s Chat Completions API with:
+- Simple chat interface (`ChatGPT::chat`)
+- Function calling (tools) with schema helpers
+- Structured JSON responses validated against a JSON Schema
+- Image inputs via URL
+- Pluggable HTTP layer (bring your own client)
+
+This library focuses on clear, composable building blocks that work well in typical PHP applications.
+
+## Installation
+
+- Library: `composer require rkr/openai-chatgpt-api`
+- Optional (for examples below): `composer require guzzlehttp/guzzle`
+
+Requirements: PHP 8.1+, `ext-json` and other common extensions (see `composer.json`).
+
+## Quick Start
+
+Example with Guzzle as the HTTP client. You can implement `HttpPostInterface` with any HTTP library.
+
+```php
+<?php
+
+use GuzzleHttp\Client;
+use Kir\ChatGPT\ChatGPT;
+use Kir\ChatGPT\Http\HttpPostInterface;
+use Kir\ChatGPT\MessageTypes\ChatInput;
+use Kir\ChatGPT\OpenAIToken;
+
+require 'vendor/autoload.php';
+
+$client = new Client();
+
+$http = new class($client) implements HttpPostInterface {
+    public function __construct(private Client $client) {}
+    public function post(string $url, array $data, array $headers): string {
+        $response = $this->client->post($url, [
+            'json'    => $data,
+            'headers' => $headers,
+        ]);
+        return $response->getBody()->getContents();
+    }
+};
+
+$chat = new ChatGPT(
+    token: new OpenAIToken(getenv('OPENAI_API_KEY') ?: ''),
+    httpPostClient: $http,
+);
+
+$response = $chat->chat([
+    ChatInput::mk('Write a short haiku about PHP.'),
+]);
+
+echo $response->firstChoice()->result, "\n";
+```
+
+## Core API: `ChatGPT::chat`
+
+Signature (simplified):
+
+- `chat(array $context, ?GPTFunctions $functions = null, ?JsonSchemaResponseFormat $responseFormat = null, ?ChatModelName $model = null, int $maxTokens = 2500, ?float $temperature = null, ?float $topP = null): ChatResponse`
+
+Key concepts:
+- Context is an array of chat messages (e.g., `ChatInput`, `ToolCall`, `ToolResult`).
+- Optional `functions` enables tool/function-calling.
+- Optional `responseFormat` enforces structured JSON responses.
+- Optional `model` lets you choose a predefined or custom model name.
+
+Minimal example using default model:
+
+```php
+use Kir\ChatGPT\MessageTypes\ChatInput;
+
+$response = $chat->chat([
+    new ChatInput('Summarize why typing helps in PHP 8.1.'),
+]);
+echo $response->firstChoice()->result;
+```
+
+Choose a model explicitly:
+
+```php
+use Kir\ChatGPT\PredefinedModels\LLMSmallNoReasoning;   // gpt-4.1-mini
+use Kir\ChatGPT\PredefinedModels\LLMMediumNoReasoning;  // gpt-4.1
+
+$response = $chat->chat(
+    context: [new ChatInput('Explain traits in PHP.')],
+    model: new LLMSmallNoReasoning(),
+    maxTokens: 512,
+    temperature: 0.7,
+);
+```
+
+Image input via URL:
+
+```php
+use Kir\ChatGPT\Messages\ChatImageUrl;
+use Kir\ChatGPT\MessageTypes\ChatInput;
+
+$response = $chat->chat([
+    new ChatInput(
+        content: 'Describe this image',
+        attachment: new ChatImageUrl('https://example.com/cat.jpg')
+    ),
+]);
+```
+
+## Structured JSON Responses
+
+Enforce structured output using a JSON Schema via `JsonSchemaResponseFormat`. The library validates the response before returning it.
+
+```php
+use Kir\ChatGPT\MessageTypes\ChatInput;
+use Kir\ChatGPT\ResponseFormat\JsonSchemaResponseFormat;
+
+$response = $chat->chat(
+    context: [
+        new ChatInput('Return the numbers 1..5 in a JSON object: {"items": [1,2,3,4,5]}'),
+    ],
+    responseFormat: new JsonSchemaResponseFormat([
+        'name' => 'Response',
+        'schema' => [
+            'type' => 'object',
+            'properties' => [
+                'items' => [
+                    'type' => 'array',
+                    'items' => ['type' => 'integer']
+                ],
+            ],
+            'additionalProperties' => false,
+        ],
+    ])
+);
+
+// When using a JSON schema, result is decoded JSON (object)
+$data = $response->firstChoice()->result;
+var_dump($data->items); // e.g., array(1,2,3,4,5)
+```
+
+Note about JSON decoding: Internally, `JSON::parse` returns objects (not associative arrays) so empty JSON objects `{}` and arrays `[]` remain distinguishable. This matters for tool-call arguments and schema-validated responses.
+
+## Function Calling (Tools)
+
+Describe callable tools with names, descriptions, and typed parameters. The model may choose to call them, returning tool calls you can execute and then respond to.
+
+```php
+use Kir\ChatGPT\Functions\Function\GPTProperties;
+use Kir\ChatGPT\Functions\Function\Types\GPTNumberProperty;
+use Kir\ChatGPT\Functions\GPTFunction;
+use Kir\ChatGPT\Functions\GPTFunctions;
+use Kir\ChatGPT\MessageTypes\ChatInput;
+use Kir\ChatGPT\MessageTypes\ToolResult;
+
+$context = [new ChatInput('What is the current temperature in Berlin? Answer in de-DE.')];
+
+$functions = new GPTFunctions(
+    new GPTFunction(
+        name: 'get_temperature',
+        description: 'Returns the current temperature from a given longitude and latitude.',
+        properties: new GPTProperties(
+            new GPTNumberProperty('longitude', 'The longitude of the location.', required: true),
+            new GPTNumberProperty('latitude',  'The latitude of the location.',  required: true),
+        ),
+    ),
+);
+
+// 1) Let the model decide if it wants to call a tool
+$response = $chat->chat(context: $context, functions: $functions);
+
+foreach ($response->firstChoice()->tools as $tool) {
+    if ($tool->functionName === 'get_temperature') {
+        // Add the tool-call message to the context
+        $context[] = $tool->toolCallMessage;
+
+        // Execute your system/tool here and add the result
+        $context[] = new ToolResult(
+            toolCallId: $tool->id,
+            name: $tool->functionName,
+            content: ['temperature' => 21.2, 'unit' => 'celsius'],
+        );
+    }
+}
+
+// 2) Ask the model to continue with the new context
+$response = $chat->chat(context: $context, functions: $functions);
+echo $response->firstChoice()->result, "\n";
+```
+
+## Notes
+
+- The library converts image inputs into the Chat Completions message format automatically.
+- When a JSON schema is supplied, responses are validated using `opis/json-schema`. Invalid responses throw an exception. 
+  - You can bring your own JSON schema validator by implementing `JsonSchemaValidatorInterface`.
+- `ChatResponse::firstChoice()` is a convenience for the first returned choice.
+
+## License
+
+MIT

@@ -1,0 +1,14 @@
+<?php
+
+namespace Kir\ChatGPT\Common;
+
+interface JsonSchemaValidator {
+	/**
+	 * Return true or false whenever the schema could be successfully validated against the given json schema. Must not throw an exception.
+	 *
+	 * @param mixed $data
+	 * @param mixed[] $schema
+	 * @return bool
+	 */
+	public function validate(mixed $data, array $schema): bool;
+}
